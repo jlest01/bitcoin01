@@ -95,6 +95,7 @@ def main():
     # TODO: make node_datadir arg optional and set it to this if none is set:
     #datadir = Path.home() / ".bitcoin"
     datadir = Path(args.node_datadir)
+    print(f"Using node datadir: {datadir}")
     print("Loading chain manager... ", end='', flush=True)
     chainman = pbk.load_chainman(datadir, chaintype)
     print("done.")
@@ -108,6 +109,7 @@ def main():
 
     for block_height in range(0, snapshot_height+1):
         start_time = time.time()
+        print(f"Processing block {block_height}... ", end='', flush=True)
         block_index = chainman.get_block_index_from_height(block_height)
         block_data = chainman.read_block_from_disk(block_index).data
         block = from_binary(CBlock, block_data)
@@ -141,6 +143,8 @@ def main():
                 del txid_vouts[txid]
             outputs_bitmap.extend(outputs_bitmap_extended)
         #print(f"bitmap creation took {(time.time()-t3):.3f}s")
+
+        print(f"outputs_bitmap: {outputs_bitmap}")
 
         hints_writer.write_block_bits(outputs_bitmap)
         took_time = time.time() - start_time

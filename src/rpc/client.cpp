@@ -190,6 +190,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "gettxoutproof", 0, "txids" },
     { "gettxoutsetinfo", 1, "hash_or_height" },
     { "gettxoutsetinfo", 2, "use_index"},
+    { "createhintfile", 2, "options" },
+    { "createhintfile", 2, "rollback" },
     { "dumptxoutset", 2, "options" },
     { "dumptxoutset", 2, "rollback" },
     { "lockunspent", 0, "unlock" },

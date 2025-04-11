@@ -55,6 +55,7 @@
 #include <stdint.h>
 
 #include <condition_variable>
+#include <fstream>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -2945,6 +2946,288 @@ public:
     };
 };
 
+class HintsWriter {
+    std::ostream& file;
+public:
+    explicit HintsWriter(std::ostream& f) : file(f) {}
+
+    // Writes a block's bits: writes 2 little-endian bytes for the size,
+    // then packs the bits 8 per byte.
+    void writeBlockBits(const std::vector<bool>& bitmap) {
+        std::string writebuf;
+        // Write the bitmap size as a 16-bit little-endian value.
+        uint16_t size = static_cast<uint16_t>(bitmap.size());
+        writebuf.push_back(static_cast<char>(size & 0xFF));         // lower byte
+        writebuf.push_back(static_cast<char>((size >> 8) & 0xFF));    // higher byte
+
+        uint8_t value = 0;
+        int bitpos = 0;
+        // Process each bit in the bitmap.
+        for (bool bit : bitmap) {
+            // Set the corresponding bit in 'value' if 'bit' is true.
+            if (bit) {
+                value |= (1 << bitpos);
+            }
+            ++bitpos;
+            // Once we've accumulated 8 bits, append them to writebuf.
+            if (bitpos == 8) {
+                writebuf.push_back(static_cast<char>(value));
+                bitpos = 0;
+                value = 0;
+            }
+        }
+        // If there are remaining bits (less than 8), write them too.
+        if (bitpos != 0) {
+            writebuf.push_back(static_cast<char>(value));
+        }
+
+        // Write the entire buffer to the file.
+        file.write(writebuf.c_str(), writebuf.size());
+    }
+
+    // Writes a two-byte end marker (two 0 bytes).
+    void writeEndMarker() {
+        char marker[2] = {0, 0};
+        file.write(marker, 2);
+    }
+};
+
+
+static bool isOutputInUTXOSet(/*const CCoinsViewCache& coins, */NodeContext& node, const COutPoint& outpoint)
+{
+    LOCK(::cs_main);
+    CCoinsViewCache& chain_view = node.chainman->ActiveChainstate().CoinsTip();
+    // std::optional<Coin> coin = coins.GetCoin(outpoint);
+    // auto coin{chain_view.GetCoin(outpoint)};
+    // if (!coin) {
+    //     return false;
+    // } // check if the coin exists
+    // return !coin->IsSpent();
+    return chain_view.HaveCoin(outpoint);
+}
+
+/**
+ * Serialize the UTXO set to a file for loading elsewhere.
+ *
+ * @see SnapshotMetadata
+ */
+static RPCHelpMan createhintfile()
+{
+    return RPCHelpMan{
+        "createhintfile",
+        "Write the serialized UTXO set to a file. This can be used in loadtxoutset afterwards if this snapshot height is supported in the chainparams as well.\n\n"
+        "Unless the \"latest\" type is requested, the node will roll back to the requested height and network activity will be suspended during this process. "
+        "Because of this it is discouraged to interact with the node in any other way during the execution of this call to avoid inconsistent results and race conditions, particularly RPCs that interact with blockstorage.\n\n"
+        "This call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)",
+        {
+            {"path", RPCArg::Type::STR, RPCArg::Optional::NO, "Path to the output file. If relative, will be prefixed by datadir."},
+            {"type", RPCArg::Type::STR, RPCArg::Default(""), "The type of snapshot to create. Can be \"latest\" to create a snapshot of the current UTXO set or \"rollback\" to temporarily roll back the state of the node to a historical block before creating the snapshot of a historical UTXO set. This parameter can be omitted if a separate \"rollback\" named parameter is specified indicating the height or hash of a specific historical block. If \"rollback\" is specified and separate \"rollback\" named parameter is not specified, this will roll back to the latest valid snapshot block that can currently be loaded with loadtxoutset."},
+            {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "",
+                {
+                    {"rollback", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
+                        "Height or hash of the block to roll back to before creating the snapshot. Note: The further this number is from the tip, the longer this process will take. Consider setting a higher -rpcclienttimeout value in this case.",
+                    RPCArgOptions{.skip_type_check = true, .type_str = {"", "string or numeric"}}},
+                },
+            },
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+                {
+                    // {RPCResult::Type::NUM, "coins_written", "the number of coins written in the snapshot"},
+                    // {RPCResult::Type::STR_HEX, "base_hash", "the hash of the base of the snapshot"},
+                    // {RPCResult::Type::NUM, "base_height", "the height of the base of the snapshot"},
+                    {RPCResult::Type::STR, "path", "the absolute path that the snapshot was written to"},
+                    // {RPCResult::Type::STR_HEX, "txoutset_hash", "the hash of the UTXO set contents"},
+                    // {RPCResult::Type::NUM, "nchaintx", "the number of transactions in the chain up to and including the base block"},
+                }
+        },
+        RPCExamples{
+            HelpExampleCli("-rpcclienttimeout=0 createhintfile", "utxo.dat latest") +
+            HelpExampleCli("-rpcclienttimeout=0 createhintfile", "utxo.dat rollback") +
+            HelpExampleCli("-rpcclienttimeout=0 -named createhintfile", R"(utxo.dat rollback=853456)")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    const CBlockIndex* tip{WITH_LOCK(::cs_main, return node.chainman->ActiveChain().Tip())};
+    const CBlockIndex* target_index{nullptr};
+    const std::string snapshot_type{self.Arg<std::string>("type")};
+    const UniValue options{request.params[2].isNull() ? UniValue::VOBJ : request.params[2]};
+    if (options.exists("rollback")) {
+        if (!snapshot_type.empty() && snapshot_type != "rollback") {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid snapshot type \"%s\" specified with rollback option", snapshot_type));
+        }
+        target_index = ParseHashOrHeight(options["rollback"], *node.chainman);
+    } else if (snapshot_type == "rollback") {
+        auto snapshot_heights = node.chainman->GetParams().GetAvailableSnapshotHeights();
+        CHECK_NONFATAL(snapshot_heights.size() > 0);
+        auto max_height = std::max_element(snapshot_heights.begin(), snapshot_heights.end());
+        target_index = ParseHashOrHeight(*max_height, *node.chainman);
+    } else if (snapshot_type == "latest") {
+        target_index = tip;
+    } else {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid snapshot type \"%s\" specified. Please specify \"rollback\" or \"latest\"", snapshot_type));
+    }
+
+    const ArgsManager& args{EnsureAnyArgsman(request.context)};
+    const fs::path path = fsbridge::AbsPathJoin(args.GetDataDirNet(), fs::u8path(request.params[0].get_str()));
+    // Write to a temporary path and then move into `path` on completion
+    // to avoid confusion due to an interruption.
+    const fs::path temppath = fsbridge::AbsPathJoin(args.GetDataDirNet(), fs::u8path(request.params[0].get_str() + ".incomplete"));
+
+    if (fs::exists(path)) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            path.utf8string() + " already exists. If you are sure this is what you want, "
+            "move it out of the way first");
+    }
+
+    FILE* file{fsbridge::fopen(temppath, "wb")};
+    AutoFile afile{file};
+    if (afile.IsNull()) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "Couldn't open file " + temppath.utf8string() + " for writing.");
+    }
+
+    CConnman& connman = EnsureConnman(node);
+    const CBlockIndex* invalidate_index{nullptr};
+    std::optional<NetworkDisable> disable_network;
+    std::optional<TemporaryRollback> temporary_rollback;
+
+    // If the user wants to dump the txoutset of the current tip, we don't have
+    // to roll back at all
+    if (target_index != tip) {
+        // If the node is running in pruned mode we ensure all necessary block
+        // data is available before starting to roll back.
+        if (node.chainman->m_blockman.IsPruneMode()) {
+            LOCK(node.chainman->GetMutex());
+            const CBlockIndex* current_tip{node.chainman->ActiveChain().Tip()};
+            const CBlockIndex* first_block{node.chainman->m_blockman.GetFirstBlock(*current_tip, /*status_mask=*/BLOCK_HAVE_MASK)};
+            if (first_block->nHeight > target_index->nHeight) {
+                throw JSONRPCError(RPC_MISC_ERROR, "Hint files cannot be generated in prune mode.");
+            }
+        }
+
+        // Suspend network activity for the duration of the process when we are
+        // rolling back the chain to get a utxo set from a past height. We do
+        // this so we don't punish peers that send us that send us data that
+        // seems wrong in this temporary state. For example a normal new block
+        // would be classified as a block connecting an invalid block.
+        // Skip if the network is already disabled because this
+        // automatically re-enables the network activity at the end of the
+        // process which may not be what the user wants.
+        if (connman.GetNetworkActive()) {
+            disable_network.emplace(connman);
+        }
+
+        invalidate_index = WITH_LOCK(::cs_main, return node.chainman->ActiveChain().Next(target_index));
+        temporary_rollback.emplace(*node.chainman, *invalidate_index);
+    }
+
+    Chainstate* chainstate;
+    std::unique_ptr<CCoinsViewCursor> cursor;
+ 
+    int block_height = 0;
+
+    int startTime = 0;
+    int start_height = 0;
+    uint256 start_block;
+    bool start = node.chain->findFirstBlockWithTimeAndHeight(startTime - TIMESTAMP_WINDOW, 0, interfaces::FoundBlock().hash(start_block).height(start_height));
+
+    int iteration = 0;
+
+    uint256 block_hash = start_block;
+
+    bool fetch_block{true};
+    bool block_still_active = false;
+    bool next_block = false;
+    uint256 next_block_hash;
+
+    // FILE* file{fsbridge::fopen(temppath, "wb")};
+    std::ofstream outfile(temppath, std::ios::binary);
+    HintsWriter writer(outfile);
+
+    while (!node.chain->shutdownRequested()) {
+
+        node.chain->findBlock(block_hash, interfaces::FoundBlock().inActiveChain(block_still_active).nextBlock(interfaces::FoundBlock().inActiveChain(next_block).hash(next_block_hash)));
+
+        if (fetch_block) {
+            // Read block data
+            CBlock block;
+            node.chain->findBlock(block_hash, interfaces::FoundBlock().data(block));
+
+            if (!block.IsNull()) {
+                if (!block_still_active) {
+                    throw JSONRPCError(RPC_MISC_ERROR, strprintf("Hint files cannot be generated because the block_hash %s is inactive", block_hash.GetHex()));
+                }
+            }
+
+            std::vector<bool> block_outputs_bitmap(block.vtx.size(), false);
+
+            // std::cout << "Processing block " << block_hash.GetHex() << " at height " << block_height << std::endl;
+
+            for (size_t posInBlock = 0; posInBlock < block.vtx.size(); ++posInBlock) {
+                // auto vtx = block.vtx[posInBlock];
+                // vtx->vout
+                // SyncTransaction(block.vtx[posInBlock], TxStateConfirmed{block_hash, block_height, static_cast<int>(posInBlock)}, fUpdate, /*rescanning_old_block=*/true);
+
+                
+                auto vtx = block.vtx[posInBlock];
+                // for (const CTxOut& txout : vtx->vout) {
+                //     COutPoint(txid, i)
+                //     // isOutputInUTXOSet(txout.
+                // }
+                std::vector<bool> tx_outputs_bitmap(vtx->vout.size(), false);
+
+                const Txid& txid = vtx->GetHash();
+                for (size_t voutIndex = 0; voutIndex < vtx->vout.size(); ++voutIndex) {
+                    auto availabeCoin = isOutputInUTXOSet(node, COutPoint(txid, voutIndex));
+
+                    // auto xx = strprintf("txid %s voutIndex %d is available: %s", txid.GetHex(), voutIndex, availabeCoin ? "available" : "spent");
+                    // std::cout << xx << std::endl;
+                    tx_outputs_bitmap[voutIndex] = availabeCoin;
+                }
+
+                block_outputs_bitmap.insert(block_outputs_bitmap.end(), tx_outputs_bitmap.begin(), tx_outputs_bitmap.end());
+            }
+
+            writer.writeBlockBits(block_outputs_bitmap);
+        }
+
+
+        // std::cout << "Processing block " << block_hash.GetHex() << " at height " << block_height << std::endl;
+        // std::cout << "next_block_hash " << next_block_hash.GetHex() << std::endl;
+
+
+        if (block_height >= target_index->nHeight) {
+            break;
+        }
+
+        if (!next_block) {
+            // break successfully when rescan has reached the tip, or
+            // previous block is no longer on the chain due to a reorg
+            break;
+        }
+
+        // increment block and verification progress
+        block_hash = next_block_hash;
+        ++block_height;
+
+    }
+
+    writer.writeEndMarker();
+    outfile.close();
+
+    fs::rename(temppath, path);
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("path", path.utf8string());
+    return result;
+},
+    };
+}
+
 /**
  * Serialize the UTXO set to a file for loading elsewhere.
  *
@@ -3403,6 +3686,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &scanblocks},
         {"blockchain", &getdescriptoractivity},
         {"blockchain", &getblockfilter},
+        {"blockchain", &createhintfile},
         {"blockchain", &dumptxoutset},
         {"blockchain", &loadtxoutset},
         {"blockchain", &getchainstates},
